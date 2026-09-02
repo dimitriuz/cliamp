@@ -1,6 +1,7 @@
 package navidrome
 
 import (
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -601,4 +602,74 @@ func trackWithNavidromeMeta(id string) playlist.Track {
 		meta[provider.MetaNavidromeID] = id
 	}
 	return playlist.Track{ProviderMeta: meta}
+}
+
+// largePlaylistBody builds a valid getPlaylist response whose encoded size
+// exceeds sizeBytes, mimicking a Navidrome playlist with many thousands of
+// entries. Each entry is padded so the test stays cheap to generate.
+func largePlaylistBody(sizeBytes int) []byte {
+	pad := strings.Repeat("x", 4000)
+	var b strings.Builder
+	b.WriteString(`{"subsonic-response":{"status":"ok","playlist":{"entry":[`)
+	for i := 0; b.Len() < sizeBytes; i++ {
+		if i > 0 {
+			b.WriteString(",")
+		}
+		fmt.Fprintf(&b, `{"id":"song-%d","title":"Track %d","artist":"A","album":"%s","year":2020,"track":%d,"genre":"G","duration":180}`, i, i, pad, i)
+	}
+	b.WriteString(`]}}}`)
+	return []byte(b.String())
+}
+
+// TestTracks_LargePlaylist guards against silently truncating the response
+// body. A playlist bigger than the read cap must not be cut mid-JSON and
+// surfaced as "unexpected end of JSON input".
+func TestTracks_LargePlaylist(t *testing.T) {
+	// 16 MB mirrors a real ~13k-track Navidrome playlist, which used to be
+	// truncated by the read cap. Fixed size, not derived from the cap, so the
+	// test keeps its meaning if the cap moves.
+	body := largePlaylistBody(16 << 20)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Write(body)
+	}))
+	defer srv.Close()
+
+	c := New(srv.URL, "u", "p")
+	tracks, err := c.Tracks("pl-big")
+	if err != nil {
+		t.Fatalf("Tracks() on %d-byte playlist: %v", len(body), err)
+	}
+	if len(tracks) == 0 {
+		t.Fatal("Tracks() returned no tracks for a large playlist")
+	}
+	if tracks[0].Title != "Track 0" {
+		t.Errorf("tracks[0].Title = %q, want %q", tracks[0].Title, "Track 0")
+	}
+}
+
+// TestSubsonicGet_OversizeResponse checks that a response too large to read
+// fails with an explicit size error instead of a confusing JSON parse error.
+func TestSubsonicGet_OversizeResponse(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(`{"subsonic-response":{"status":"ok","playlist":{"entry":[`))
+		chunk := strings.Repeat("x", 1<<20)
+		for written := 0; written < maxResponseBody+(1<<20); written += len(chunk) {
+			w.Write([]byte(chunk))
+		}
+	}))
+	defer srv.Close()
+
+	c := New(srv.URL, "u", "p")
+	_, err := c.Tracks("pl-huge")
+	if err == nil {
+		t.Fatal("expected an error for an oversize response, got nil")
+	}
+	if strings.Contains(err.Error(), "unexpected end of JSON input") {
+		t.Errorf("got opaque truncation error %q, want an explicit size error", err)
+	}
+	if !strings.Contains(err.Error(), "exceeds") {
+		t.Errorf("error = %q, want it to mention the size limit", err)
+	}
 }
